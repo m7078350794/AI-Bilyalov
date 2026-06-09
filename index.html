@@ -16,6 +16,14 @@
                 <div class="app-logo-icon">✨</div>
                 <h1>Расшифровщик</h1>
             </div>
+            <div class="header-actions">
+                <button class="btn-icon" id="settingsBtn" title="Настройки API">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
+                        <circle cx="12" cy="12" r="3"></circle>
+                    </svg>
+                </button>
+            </div>
         </header>
 
         <!-- View 1: Upload -->
@@ -138,6 +146,44 @@
                 </div>
             </section>
         </main>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="modal-overlay" id="settingsOverlay">
+        <div class="modal">
+            <h2>
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
+                    <circle cx="12" cy="12" r="3"></circle>
+                </svg>
+                Настройки API
+            </h2>
+            
+            <form id="settingsForm">
+                <div class="form-group">
+                    <label for="openaiKeyInput">OpenAI или Groq API Key (обязательно)</label>
+                    <input type="password" id="openaiKeyInput" placeholder="sk-... или gsk_..." required>
+                    <div class="hint">Используется для распознавания речи. Вставьте ключ от OpenAI (платный, Whisper API) или <a href="https://console.groq.com/keys" target="_blank">ключ от Groq</a> (бесплатный, работает в 10 раз быстрее!). Бэкенд сам определит нужный сервис.</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="hfTokenInput">HuggingFace Token (опционально)</label>
+                    <input type="password" id="hfTokenInput" placeholder="hf_...">
+                    <div class="hint">Необходим для разделения по голосам (диаризации). <a href="https://huggingface.co/settings/tokens" target="_blank">Получить токен</a> и <a href="https://huggingface.co/pyannote/speaker-diarization-3.1" target="_blank">принять условия</a>.</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="apiUrlInput">URL Бэкенд-сервера</label>
+                    <input type="url" id="apiUrlInput" placeholder="http://127.0.0.1:5000">
+                    <div class="hint">Если бэкенд размещен на другом сервере, укажите его адрес здесь. Для локального запуска оставьте по умолчанию.</div>
+                </div>
+
+                <div class="modal-actions">
+                    <button type="button" class="btn-cancel" id="cancelSettings">Отмена</button>
+                    <button type="submit" class="btn-save">Сохранить</button>
+                </div>
+            </form>
+        </div>
     </div>
 
     <!-- Toast Notifications -->

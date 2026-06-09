@@ -25,28 +25,37 @@ def transcribe_audio(filepath, api_key, on_progress=None):
     Returns:
         dict with 'segments', 'words', and 'language'
     """
-    client = OpenAI(api_key=api_key)
+    if api_key.startswith("gsk_"):
+        # Auto-detect Groq API key
+        client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+        model = "whisper-large-v3-turbo" # Or whisper-large-v3
+    else:
+        # Default to OpenAI
+        client = OpenAI(api_key=api_key)
+        model = "whisper-1"
+
     file_size = os.path.getsize(filepath)
 
     if file_size <= MAX_FILE_SIZE:
         if on_progress:
-            on_progress(0.1, "Отправка аудио в Whisper API...")
+        if on_progress:
+            on_progress(0.1, f"Отправка аудио в {model}...")
 
-        result = _transcribe_chunk(client, filepath, offset=0)
+        result = _transcribe_chunk(client, filepath, model, offset=0)
 
         if on_progress:
             on_progress(1.0, "Транскрипция завершена")
 
         return result
     else:
-        return _transcribe_large_file(client, filepath, on_progress)
+        return _transcribe_large_file(client, filepath, model, on_progress)
 
 
-def _transcribe_chunk(client, filepath, offset=0):
-    """Transcribe a single audio chunk via the Whisper API."""
+def _transcribe_chunk(client, filepath, model="whisper-1", offset=0):
+    """Transcribe a single audio chunk via the API."""
     with open(filepath, "rb") as f:
         response = client.audio.transcriptions.create(
-            model="whisper-1",
+            model=model,
             file=f,
             response_format="verbose_json",
             timestamp_granularities=["segment", "word"],
@@ -81,7 +90,7 @@ def _transcribe_chunk(client, filepath, offset=0):
     return {"segments": segments, "words": words, "language": language}
 
 
-def _transcribe_large_file(client, filepath, on_progress=None):
+def _transcribe_large_file(client, filepath, model="whisper-1", on_progress=None):
     """Split large audio file into chunks and transcribe each sequentially."""
     audio = AudioSegment.from_file(filepath)
 
@@ -115,7 +124,7 @@ def _transcribe_large_file(client, filepath, on_progress=None):
                 on_progress(progress, f"Транскрипция фрагмента {i + 1}/{num_chunks}...")
 
             offset = start_ms / 1000.0
-            result = _transcribe_chunk(client, tmp_path, offset=offset)
+            result = _transcribe_chunk(client, tmp_path, model, offset=offset)
 
             all_segments.extend(result["segments"])
             all_words.extend(result["words"])
