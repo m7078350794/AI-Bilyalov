@@ -1,5 +1,5 @@
 /**
- * Main Application Logic — Расшифровщик (Serverless via AssemblyAI)
+ * Main Application Logic — Расшифровщик (Serverless via Deepgram)
  * Handles file upload, direct API communication, transcript rendering,
  * speaker management, and export functionality without a backend.
  */
@@ -16,23 +16,19 @@
     '#f472b6', '#22d3ee', '#a3e635', '#fb923c', '#c084fc',
   ];
 
-  const ASSEMBLY_API_BASE = 'https://api.assemblyai.com/v2';
+  const DEEPGRAM_API_BASE = 'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true&detect_language=true';
+  const HARDCODED_KEY = '8494995b5bbe658937f0b88928870ab6e5a4b460';
 
   const state = {
-    // API key (loaded from localStorage)
-    assemblyKey: '',
+    // API key
+    deepgramKey: HARDCODED_KEY,
 
     // Current file
     currentFile: null,
 
-    // Task
-    taskId: null,
-    pollInterval: null,
-
     // Result
     blocks: [],           // [{speaker, text, start, end}]
     speakerNames: {},     // SPEAKER_0 -> 'Спикер 1'
-    hasDiarization: true, // AssemblyAI always does diarization if requested
     language: '',
 
     // Audio player
@@ -71,7 +67,7 @@
     settingsOverlay: $('#settingsOverlay'),
     settingsForm: $('#settingsForm'),
     cancelSettings: $('#cancelSettings'),
-    assemblyKeyInput: $('#assemblyKeyInput'),
+    assemblyKeyInput: $('#assemblyKeyInput'), // We reuse the ID but change the label
 
     // Toast
     toastContainer: $('#toastContainer'),
@@ -92,12 +88,15 @@
   }
 
   function loadSettings() {
-    state.assemblyKey = localStorage.getItem('rash_assembly_key') || '';
+    const saved = localStorage.getItem('rash_deepgram_key');
+    if (saved) {
+        state.deepgramKey = saved;
+    }
   }
 
   function saveSettings() {
-    state.assemblyKey = dom.assemblyKeyInput.value.trim();
-    localStorage.setItem('rash_assembly_key', state.assemblyKey);
+    state.deepgramKey = dom.assemblyKeyInput.value.trim() || HARDCODED_KEY;
+    localStorage.setItem('rash_deepgram_key', state.deepgramKey);
   }
 
   /* ══════════════════════════════════════════════
@@ -161,7 +160,7 @@
      ══════════════════════════════════════════════ */
 
   function openSettings() {
-    dom.assemblyKeyInput.value = state.assemblyKey;
+    dom.assemblyKeyInput.value = state.deepgramKey;
     dom.settingsOverlay.classList.add('visible');
   }
 
@@ -175,14 +174,8 @@
 
   function handleFile(file) {
     // Validate
-    if (!file.type.startsWith('audio/') && !file.name.match(/\.(mp3|wav|m4a|ogg|flac|aac|wma|webm|mp4)$/i)) {
-      toast('Пожалуйста, загрузите аудиофайл', 'error');
-      return;
-    }
-
-    if (!state.assemblyKey) {
-      toast('Сначала укажите AssemblyAI API ключ в настройках', 'error');
-      openSettings();
+    if (!file.type.startsWith('audio/') && !file.type.startsWith('video/') && !file.name.match(/\.(mp3|wav|m4a|ogg|flac|aac|wma|webm|mp4)$/i)) {
+      toast('Пожалуйста, загрузите аудио или видеофайл', 'error');
       return;
     }
 
@@ -196,57 +189,40 @@
   }
 
   /* ══════════════════════════════════════════════
-     Transcription Flow (AssemblyAI Direct Integration)
+     Transcription Flow (Deepgram Direct Integration)
      ══════════════════════════════════════════════ */
 
   async function startTranscription(file) {
     showView('processing');
     dom.processingFilename.textContent = file.name;
-    updateProgress(0.1, 'Загрузка файла на сервер (1/3)...');
+    updateProgress(0.2, 'Отправка аудио в Deepgram...');
 
     try {
-      // Step 1: Upload the file to AssemblyAI
-      const uploadRes = await fetch(`${ASSEMBLY_API_BASE}/upload`, {
+      // Create a simulated progress for the synchronous fetch request
+      let simProgress = 0.2;
+      const interval = setInterval(() => {
+        simProgress = Math.min(simProgress + 0.05, 0.95);
+        updateProgress(simProgress, 'Анализ аудио и разделение по спикерам... (Deepgram работает быстро!)');
+      }, 1000);
+
+      const response = await fetch(DEEPGRAM_API_BASE, {
         method: 'POST',
         headers: {
-          'Authorization': state.assemblyKey,
-          'Content-Type': 'application/octet-stream',
+          'Authorization': `Token ${state.deepgramKey}`,
+          'Content-Type': file.type || 'audio/mpeg'
         },
         body: file,
       });
 
-      if (!uploadRes.ok) {
-        throw new Error('Ошибка загрузки файла. Проверьте API ключ.');
-      }
-      
-      const uploadData = await uploadRes.json();
-      const audioUrl = uploadData.upload_url;
+      clearInterval(interval);
 
-      // Step 2: Submit the transcription job
-      updateProgress(0.3, 'Запуск распознавания и разделения голосов (2/3)...');
-      
-      const transcriptRes = await fetch(`${ASSEMBLY_API_BASE}/transcript`, {
-        method: 'POST',
-        headers: {
-          'Authorization': state.assemblyKey,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          audio_url: audioUrl,
-          speaker_labels: true, // Enable diarization!
-          language_detection: true, // Auto-detect language
-        }),
-      });
-
-      if (!transcriptRes.ok) {
-        throw new Error('Ошибка запуска транскрипции');
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Ошибка API (${response.status}): ${errText}`);
       }
 
-      const transcriptData = await transcriptRes.json();
-      state.taskId = transcriptData.id;
-
-      // Step 3: Poll for completion
-      startPolling();
+      const data = await response.json();
+      processResult(data);
 
     } catch (err) {
       toast(err.message, 'error');
@@ -254,65 +230,27 @@
     }
   }
 
-  function startPolling() {
-    // Prevent multiple pollers
-    if (state.pollInterval) clearInterval(state.pollInterval);
-
-    state.pollInterval = setInterval(async () => {
-      try {
-        const res = await fetch(`${ASSEMBLY_API_BASE}/transcript/${state.taskId}`, {
-          headers: { 'Authorization': state.assemblyKey },
-        });
-        const data = await res.json();
-
-        if (data.status === 'processing') {
-          // AssemblyAI doesn't provide precise percentage, we fake a slow progress
-          const currPct = parseInt(dom.progressPct.textContent) / 100;
-          const nextPct = Math.min(currPct + 0.05, 0.90);
-          updateProgress(nextPct, 'Идет анализ и диаризация... (это займет время)');
-        } 
-        else if (data.status === 'completed') {
-          stopPolling();
-          processResult(data);
-        } 
-        else if (data.status === 'error') {
-          stopPolling();
-          toast(data.error || 'Произошла ошибка при расшифровке', 'error');
-          showView('upload');
-        }
-      } catch (err) {
-        console.error('Polling error:', err);
-      }
-    }, 3000); // Poll every 3 seconds
-  }
-
-  function stopPolling() {
-    if (state.pollInterval) {
-      clearInterval(state.pollInterval);
-      state.pollInterval = null;
-    }
-  }
-
   function processResult(data) {
     updateProgress(1.0, 'Готово!');
-    state.language = data.language_code;
     
-    // Map AssemblyAI utterances to our blocks format
-    if (data.utterances && data.utterances.length > 0) {
-      state.blocks = data.utterances.map((u) => ({
-        speaker: `SPEAKER_${u.speaker}`, // They return 'A', 'B', 'C', we convert for consistency or just use raw
-        text: u.text,
-        start: u.start / 1000, // Convert ms to seconds
-        end: u.end / 1000,
-      }));
+    const results = data.results;
+    if (!results || !results.utterances) {
+       // Fallback if utterances are missing for some reason
+       const text = results?.channels?.[0]?.alternatives?.[0]?.transcript || 'Не удалось распознать текст';
+       state.blocks = [{
+         speaker: 'SPEAKER_0',
+         text: text,
+         start: 0,
+         end: state.player.getDuration() || 0,
+       }];
     } else {
-      // Fallback if no utterances (e.g., only 1 speaker or diarization failed)
-      state.blocks = [{
-        speaker: 'SPEAKER_A',
-        text: data.text,
-        start: 0,
-        end: state.player.getDuration() || 0,
-      }];
+        // Map Deepgram utterances to our blocks format
+        state.blocks = results.utterances.map((u) => ({
+            speaker: `SPEAKER_${u.speaker}`, 
+            text: u.transcript,
+            start: u.start,
+            end: u.end,
+        }));
     }
 
     // Initialize speaker names
@@ -571,9 +509,7 @@
   }
 
   function resetState() {
-    stopPolling();
     state.currentFile = null;
-    state.taskId = null;
     state.blocks = [];
     state.speakerNames = {};
     dom.transcript.innerHTML = '';
