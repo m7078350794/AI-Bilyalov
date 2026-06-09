@@ -1,7 +1,7 @@
 /**
- * Main Application Logic — Расшифровщик (Serverless via Deepgram)
- * Handles file upload, direct API communication, transcript rendering,
- * speaker management, and export functionality without a backend.
+ * Main Application Logic — Расшифровщик (Multi-file Serverless via Deepgram)
+ * Handles multiple file uploads, direct API communication, dynamic result cards,
+ * speaker management, and DOCX/TXT/SRT export functionality.
  */
 
 (function () {
@@ -20,19 +20,11 @@
   const HARDCODED_KEY = '8494995b5bbe658937f0b88928870ab6e5a4b460';
 
   const state = {
-    // API key
     deepgramKey: HARDCODED_KEY,
-
-    // Current file
-    currentFile: null,
-
-    // Result
-    blocks: [],           // [{speaker, text, start, end}]
-    speakerNames: {},     // SPEAKER_0 -> 'Спикер 1'
-    language: '',
-
-    // Audio player
-    player: null,
+    
+    // Array of file objects
+    // { id, file, status, progress, message, blocks, speakerNames, language, player }
+    files: [], 
   };
 
   /* ══════════════════════════════════════════════
@@ -40,37 +32,29 @@
      ══════════════════════════════════════════════ */
 
   const $ = (sel) => document.querySelector(sel);
-  const $$ = (sel) => document.querySelectorAll(sel);
 
   const dom = {
-    // Views
     uploadView: $('#uploadView'),
     processingView: $('#processingView'),
     resultsView: $('#resultsView'),
 
-    // Upload
     dropZone: $('#dropZone'),
     fileInput: $('#fileInput'),
 
-    // Processing
-    progressFill: $('#progressFill'),
-    progressPct: $('#progressPct'),
-    progressMsg: $('#progressMsg'),
-    processingFilename: $('#processingFilename'),
+    processingList: $('#processingList'),
+    resultsList: $('#resultsList'),
 
-    // Results
-    speakersList: $('#speakersList'),
-    transcript: $('#transcript'),
-
-    // Settings
     settingsBtn: $('#settingsBtn'),
     settingsOverlay: $('#settingsOverlay'),
     settingsForm: $('#settingsForm'),
     cancelSettings: $('#cancelSettings'),
-    assemblyKeyInput: $('#assemblyKeyInput'), // We reuse the ID but change the label
+    assemblyKeyInput: $('#assemblyKeyInput'),
 
-    // Toast
     toastContainer: $('#toastContainer'),
+
+    // Templates
+    progressTemplate: $('#progressItemTemplate'),
+    cardTemplate: $('#resultCardTemplate'),
   };
 
   /* ══════════════════════════════════════════════
@@ -80,18 +64,12 @@
   function init() {
     loadSettings();
     bindEvents();
-    showView('upload');
-
-    // Instantiate audio player
-    state.player = new window.AudioPlayer();
-    state.player.onTimeUpdate(onPlayerTimeUpdate);
+    updateView();
   }
 
   function loadSettings() {
     const saved = localStorage.getItem('rash_deepgram_key');
-    if (saved) {
-        state.deepgramKey = saved;
-    }
+    if (saved) state.deepgramKey = saved;
   }
 
   function saveSettings() {
@@ -107,167 +85,215 @@
     // ── Drag & Drop ──
     dom.dropZone.addEventListener('click', () => dom.fileInput.click());
     dom.fileInput.addEventListener('change', (e) => {
-      if (e.target.files.length) handleFile(e.target.files[0]);
+      if (e.target.files.length) handleFiles(e.target.files);
     });
 
-    dom.dropZone.addEventListener('dragenter', (e) => {
-      e.preventDefault();
-      dom.dropZone.classList.add('drag-over');
-    });
-    dom.dropZone.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      dom.dropZone.classList.add('drag-over');
-    });
-    dom.dropZone.addEventListener('dragleave', () => {
-      dom.dropZone.classList.remove('drag-over');
-    });
+    dom.dropZone.addEventListener('dragenter', (e) => { e.preventDefault(); dom.dropZone.classList.add('drag-over'); });
+    dom.dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dom.dropZone.classList.add('drag-over'); });
+    dom.dropZone.addEventListener('dragleave', () => { dom.dropZone.classList.remove('drag-over'); });
     dom.dropZone.addEventListener('drop', (e) => {
       e.preventDefault();
       dom.dropZone.classList.remove('drag-over');
-      if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+      if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
     });
 
     // ── Settings Modal ──
-    dom.settingsBtn.addEventListener('click', openSettings);
-    dom.cancelSettings.addEventListener('click', closeSettings);
-    dom.settingsOverlay.addEventListener('click', (e) => {
-      if (e.target === dom.settingsOverlay) closeSettings();
+    dom.settingsBtn.addEventListener('click', () => {
+      dom.assemblyKeyInput.value = state.deepgramKey;
+      dom.settingsOverlay.classList.add('visible');
     });
+    dom.cancelSettings.addEventListener('click', () => dom.settingsOverlay.classList.remove('visible'));
+    dom.settingsOverlay.addEventListener('click', (e) => { if (e.target === dom.settingsOverlay) dom.settingsOverlay.classList.remove('visible'); });
     dom.settingsForm.addEventListener('submit', (e) => {
       e.preventDefault();
       saveSettings();
-      closeSettings();
+      dom.settingsOverlay.classList.remove('visible');
       toast('Настройки сохранены', 'success');
     });
 
-    // ── New transcription button ──
+    // ── Add More Button ──
     document.addEventListener('click', (e) => {
       if (e.target.closest('#newTranscriptionBtn')) {
-        resetState();
-        showView('upload');
+        dom.fileInput.value = '';
+        dom.fileInput.click();
       }
     });
 
-    // ── Export buttons ──
+    // ── Export Buttons ──
     document.addEventListener('click', (e) => {
       const btn = e.target.closest('.btn-export');
-      if (btn) exportAs(btn.dataset.format);
+      if (btn) {
+        const fileId = btn.closest('.result-card').dataset.fileId;
+        exportAs(fileId, btn.dataset.format);
+      }
+    });
+
+    // ── Speaker Rename ──
+    document.addEventListener('change', (e) => {
+      if (e.target.classList.contains('speaker-name-input')) {
+        const card = e.target.closest('.result-card');
+        const fileId = card.dataset.fileId;
+        const speakerId = e.target.dataset.speaker;
+        renameSpeaker(fileId, speakerId, e.target.value.trim(), card);
+      }
+    });
+    document.addEventListener('focusin', (e) => {
+      if (e.target.classList.contains('speaker-name-input')) e.target.select();
     });
   }
 
   /* ══════════════════════════════════════════════
-     Settings Modal
+     File Handling & View Logic
      ══════════════════════════════════════════════ */
 
-  function openSettings() {
-    dom.assemblyKeyInput.value = state.deepgramKey;
-    dom.settingsOverlay.classList.add('visible');
-  }
+  function handleFiles(fileList) {
+    const validFiles = Array.from(fileList).filter(f => 
+      f.type.startsWith('audio/') || f.type.startsWith('video/') || f.name.match(/\.(mp3|wav|m4a|ogg|flac|aac|wma|webm|mp4)$/i)
+    );
 
-  function closeSettings() {
-    dom.settingsOverlay.classList.remove('visible');
-  }
-
-  /* ══════════════════════════════════════════════
-     File Handling
-     ══════════════════════════════════════════════ */
-
-  function handleFile(file) {
-    // Validate
-    if (!file.type.startsWith('audio/') && !file.type.startsWith('video/') && !file.name.match(/\.(mp3|wav|m4a|ogg|flac|aac|wma|webm|mp4)$/i)) {
-      toast('Пожалуйста, загрузите аудио или видеофайл', 'error');
+    if (validFiles.length === 0) {
+      toast('Пожалуйста, загрузите аудио или видеофайлы', 'error');
       return;
     }
 
-    state.currentFile = file;
+    // Add to state
+    validFiles.forEach(file => {
+      const fObj = {
+        id: 'file_' + Math.random().toString(36).substring(2, 9),
+        file: file,
+        status: 'processing',
+        progress: 0,
+        message: 'Подготовка...',
+        blocks: [],
+        speakerNames: {},
+        player: null
+      };
+      state.files.push(fObj);
+      startTranscription(fObj);
+    });
 
-    // Load audio into player
-    state.player.loadFile(file);
+    updateView();
+  }
 
-    // Start upload & transcription
-    startTranscription(file);
+  function updateView() {
+    const hasFiles = state.files.length > 0;
+    const isProcessing = state.files.some(f => f.status === 'processing');
+
+    if (!hasFiles) {
+      dom.uploadView.classList.remove('hidden');
+      dom.processingView.classList.add('hidden');
+      dom.resultsView.classList.add('hidden');
+      return;
+    }
+
+    dom.uploadView.classList.add('hidden');
+    
+    // We show processing view if there are ANY processing files
+    dom.processingView.classList.toggle('hidden', !isProcessing);
+    
+    // We show results view if there are ANY done files
+    const hasDone = state.files.some(f => f.status === 'done');
+    dom.resultsView.classList.toggle('hidden', !hasDone);
+
+    renderProcessingList();
   }
 
   /* ══════════════════════════════════════════════
-     Transcription Flow (Deepgram Direct Integration)
+     Processing & Deepgram Logic
      ══════════════════════════════════════════════ */
 
-  function startTranscription(file) {
-    showView('processing');
-    dom.processingFilename.textContent = file.name;
-    updateProgress(0, 'Подготовка...');
+  function renderProcessingList() {
+    dom.processingList.innerHTML = '';
+    const processingFiles = state.files.filter(f => f.status === 'processing');
 
+    processingFiles.forEach(f => {
+      const clone = dom.progressTemplate.content.cloneNode(true);
+      const el = clone.querySelector('.progress-item');
+      el.id = `progress_${f.id}`;
+      el.querySelector('.progress-filename').textContent = f.file.name;
+      el.querySelector('.progress-pct').textContent = Math.round(f.progress * 100) + '%';
+      el.querySelector('.progress-bar-fill').style.width = Math.round(f.progress * 100) + '%';
+      el.querySelector('.progress-message').textContent = f.message;
+      dom.processingList.appendChild(clone);
+    });
+  }
+
+  function updateFileProgress(fObj, progress, message) {
+    fObj.progress = progress;
+    fObj.message = message;
+    
+    const el = document.getElementById(`progress_${fObj.id}`);
+    if (el) {
+      el.querySelector('.progress-pct').textContent = Math.round(progress * 100) + '%';
+      el.querySelector('.progress-bar-fill').style.width = Math.round(progress * 100) + '%';
+      el.querySelector('.progress-message').textContent = message || '';
+    }
+  }
+
+  function startTranscription(fObj) {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', DEEPGRAM_API_BASE, true);
     xhr.setRequestHeader('Authorization', `Token ${state.deepgramKey}`);
-    xhr.setRequestHeader('Content-Type', file.type || 'audio/mpeg');
+    xhr.setRequestHeader('Content-Type', fObj.file.type || 'audio/mpeg');
 
-    // Реальный прогресс загрузки файла
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) {
         const percent = e.loaded / e.total;
-        // Загрузка занимает первые 80% визуального прогресс-бара
-        updateProgress(percent * 0.8, `Загрузка файла: ${Math.round(percent * 100)}%...`);
+        updateFileProgress(fObj, percent * 0.8, `Загрузка файла: ${Math.round(percent * 100)}%...`);
       }
     };
 
     let fakeProgressInterval;
 
-    // Когда файл полностью загрузился на сервера Deepgram
     xhr.upload.onload = () => {
-      updateProgress(0.85, 'Аудио загружено. Deepgram анализирует голоса...');
+      updateFileProgress(fObj, 0.85, 'Аудио загружено. Deepgram анализирует голоса...');
       let simProgress = 0.85;
-      // Запускаем медленный прогресс-бар для ожидания ответа
       fakeProgressInterval = setInterval(() => {
         simProgress = Math.min(simProgress + 0.01, 0.99);
-        updateProgress(simProgress, 'Расшифровка и диаризация... (пожалуйста, подождите)');
+        updateFileProgress(fObj, simProgress, 'Расшифровка и диаризация... (подождите)');
       }, 1500);
     };
 
-    // Обработка успешного/неуспешного ответа
     xhr.onload = () => {
       clearInterval(fakeProgressInterval);
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           const data = JSON.parse(xhr.responseText);
-          processResult(data);
+          processResult(fObj, data);
         } catch (e) {
-          toast('Ошибка обработки данных от сервера', 'error');
-          showView('upload');
+          handleFileError(fObj, 'Ошибка обработки данных от сервера');
         }
       } else {
-        toast(`Ошибка API (${xhr.status}): ${xhr.responseText}`, 'error');
-        showView('upload');
+        handleFileError(fObj, `Ошибка API (${xhr.status}): ${xhr.responseText}`);
       }
     };
 
-    // Сетевая ошибка (например, отвалился интернет)
     xhr.onerror = () => {
       clearInterval(fakeProgressInterval);
-      toast('Сетевая ошибка при обращении к API. Проверьте интернет.', 'error');
-      showView('upload');
+      handleFileError(fObj, 'Сетевая ошибка при обращении к API.');
     };
 
-    // Отправляем файл как бинарные данные
-    xhr.send(file);
+    xhr.send(fObj.file);
   }
 
-  function processResult(data) {
-    updateProgress(1.0, 'Готово!');
+  function handleFileError(fObj, errMessage) {
+    fObj.status = 'error';
+    toast(`Ошибка файла ${fObj.file.name}: ${errMessage}`, 'error');
+    
+    // Remove from files array
+    state.files = state.files.filter(f => f.id !== fObj.id);
+    updateView();
+  }
+
+  function processResult(fObj, data) {
+    fObj.status = 'done';
     
     const results = data.results;
     if (!results || !results.utterances) {
-       // Fallback if utterances are missing for some reason
        const text = results?.channels?.[0]?.alternatives?.[0]?.transcript || 'Не удалось распознать текст';
-       state.blocks = [{
-         speaker: 'SPEAKER_0',
-         text: text,
-         start: 0,
-         end: state.player.getDuration() || 0,
-       }];
+       fObj.blocks = [{ speaker: 'SPEAKER_0', text: text, start: 0, end: 0 }];
     } else {
-        // Map Deepgram utterances to our blocks format
-        state.blocks = results.utterances.map((u) => ({
+        fObj.blocks = results.utterances.map((u) => ({
             speaker: `SPEAKER_${u.speaker}`, 
             text: u.transcript,
             start: u.start,
@@ -275,230 +301,214 @@
         }));
     }
 
-    // Initialize speaker names
-    const speakers = new Set(state.blocks.map((b) => b.speaker));
-    state.speakerNames = {};
-    
+    // Set speakers
+    const speakers = new Set(fObj.blocks.map(b => b.speaker));
+    fObj.speakerNames = {};
     let index = 1;
-    speakers.forEach((s) => {
-      state.speakerNames[s] = `Спикер ${index++}`;
+    speakers.forEach(s => {
+      fObj.speakerNames[s] = `Спикер ${index++}`;
     });
 
-    showView('results');
-    renderSpeakers();
-    renderTranscript();
-
-    toast('Транскрипция успешно завершена!', 'success');
+    updateView();
+    renderResultCard(fObj);
+    toast(`Файл ${fObj.file.name} успешно обработан!`, 'success');
   }
 
   /* ══════════════════════════════════════════════
-     Progress UI
+     Result Cards & DOM Rendering
      ══════════════════════════════════════════════ */
 
-  function updateProgress(progress, message) {
-    const pct = Math.round(progress * 100);
-    dom.progressFill.style.width = pct + '%';
-    dom.progressPct.textContent = pct + '%';
-    dom.progressMsg.textContent = message || '';
+  function renderResultCard(fObj) {
+    const clone = dom.cardTemplate.content.cloneNode(true);
+    const card = clone.querySelector('.result-card');
+    card.dataset.fileId = fObj.id;
+    
+    card.querySelector('.file-name').textContent = fObj.file.name;
+
+    // 1. Initialize Player
+    const playerWrapper = card.querySelector('.player-wrapper');
+    fObj.player = new window.AudioPlayer(playerWrapper);
+    fObj.player.loadFile(fObj.file);
+    fObj.player.onTimeUpdate((time) => syncTranscriptScroll(card, time));
+
+    // 2. Render Speakers
+    renderCardSpeakers(fObj, card);
+
+    // 3. Render Transcript
+    renderCardTranscript(fObj, card);
+
+    dom.resultsList.prepend(clone); // Prepend to show newest at top
   }
 
-  /* ══════════════════════════════════════════════
-     View Management
-     ══════════════════════════════════════════════ */
-
-  function showView(name) {
-    dom.uploadView.classList.toggle('hidden', name !== 'upload');
-    dom.processingView.classList.toggle('hidden', name !== 'processing');
-    dom.resultsView.classList.toggle('hidden', name !== 'results');
-  }
-
-  /* ══════════════════════════════════════════════
-     Speakers Panel
-     ══════════════════════════════════════════════ */
-
-  function renderSpeakers() {
-    const speakers = Object.keys(state.speakerNames);
-    const container = dom.speakersList;
+  function renderCardSpeakers(fObj, card) {
+    const container = card.querySelector('.speakers-list');
     container.innerHTML = '';
+    const speakers = Object.keys(fObj.speakerNames);
 
     speakers.forEach((speakerId, i) => {
       const color = SPEAKER_COLORS[i % SPEAKER_COLORS.length];
-      const count = state.blocks.filter((b) => b.speaker === speakerId).length;
+      const count = fObj.blocks.filter((b) => b.speaker === speakerId).length;
 
       const item = document.createElement('div');
       item.className = 'speaker-item';
       item.innerHTML = `
         <span class="speaker-color-dot" style="background: ${color}"></span>
-        <input
-          type="text"
-          class="speaker-name-input"
-          value="${state.speakerNames[speakerId]}"
-          data-speaker="${speakerId}"
-          spellcheck="false"
-        />
+        <input type="text" class="speaker-name-input" value="${fObj.speakerNames[speakerId]}" data-speaker="${speakerId}" spellcheck="false" />
         <span class="speaker-count">${count}</span>
       `;
-
-      const input = item.querySelector('.speaker-name-input');
-      input.addEventListener('change', (e) => {
-        renameSpeaker(speakerId, e.target.value.trim());
-      });
-      input.addEventListener('focus', (e) => e.target.select());
-
       container.appendChild(item);
     });
   }
 
-  function renameSpeaker(speakerId, newName) {
+  function renameSpeaker(fileId, speakerId, newName, card) {
     if (!newName) return;
-    state.speakerNames[speakerId] = newName;
+    const fObj = state.files.find(f => f.id === fileId);
+    if (!fObj) return;
 
-    // Update all speaker labels in the transcript
-    document.querySelectorAll(`.block-speaker-name[data-speaker="${speakerId}"]`).forEach((el) => {
+    fObj.speakerNames[speakerId] = newName;
+
+    // Update in DOM
+    card.querySelectorAll(`.block-speaker-name[data-speaker="${speakerId}"]`).forEach((el) => {
       el.textContent = newName;
     });
   }
 
-  /* ══════════════════════════════════════════════
-     Transcript Rendering
-     ══════════════════════════════════════════════ */
-
-  function renderTranscript() {
-    const container = dom.transcript;
+  function renderCardTranscript(fObj, card) {
+    const container = card.querySelector('.transcript-section');
     container.innerHTML = '';
+    const speakerKeys = Object.keys(fObj.speakerNames);
 
-    // Get ordered keys to assign colors consistently
-    const speakerKeys = Object.keys(state.speakerNames);
-
-    state.blocks.forEach((block, i) => {
+    fObj.blocks.forEach((block, i) => {
       const colorIndex = speakerKeys.indexOf(block.speaker);
       const color = SPEAKER_COLORS[colorIndex % SPEAKER_COLORS.length];
-      const name = state.speakerNames[block.speaker] || block.speaker;
+      const name = fObj.speakerNames[block.speaker] || block.speaker;
 
       const el = document.createElement('div');
       el.className = 'transcript-block fade-in';
-      el.dataset.index = i;
       el.dataset.start = block.start;
       el.dataset.end = block.end;
-      el.style.animationDelay = `${Math.min(i * 30, 500)}ms`;
 
       el.innerHTML = `
         <div class="block-speaker">
-          <span class="block-speaker-name" data-speaker="${block.speaker}" style="color: ${color}">
-            ${escapeHtml(name)}
-          </span>
-          <span class="block-timestamp" data-time="${block.start}">
-            ${formatTimestamp(block.start)}
-          </span>
+          <span class="block-speaker-name" data-speaker="${block.speaker}" style="color: ${color}">${escapeHtml(name)}</span>
+          <span class="block-timestamp" data-time="${block.start}">${formatTimestamp(block.start)}</span>
         </div>
         <div class="block-text">${escapeHtml(block.text)}</div>
       `;
 
-      // Click timestamp to seek
       el.querySelector('.block-timestamp').addEventListener('click', () => {
-        state.player.seekTo(block.start);
-        state.player.play();
+        fObj.player.seekTo(block.start);
+        fObj.player.play();
       });
 
       container.appendChild(el);
     });
   }
 
-  /* ══════════════════════════════════════════════
-     Audio ↔ Transcript Sync
-     ══════════════════════════════════════════════ */
-
-  function onPlayerTimeUpdate(currentTime) {
-    const blocks = dom.transcript.querySelectorAll('.transcript-block');
+  function syncTranscriptScroll(card, currentTime) {
+    const blocks = card.querySelectorAll('.transcript-block');
     let activeEl = null;
 
     blocks.forEach((el) => {
       const start = parseFloat(el.dataset.start);
       const end = parseFloat(el.dataset.end);
       const isActive = currentTime >= start && currentTime < end;
-
       el.classList.toggle('active', isActive);
       if (isActive) activeEl = el;
     });
 
-    // Auto-scroll to active block
     if (activeEl) {
-      const container = dom.transcript;
+      const container = card.querySelector('.transcript-section');
       const elTop = activeEl.offsetTop - container.offsetTop;
       const elH = activeEl.offsetHeight;
       const scrollTop = container.scrollTop;
       const containerH = container.clientHeight;
 
       if (elTop < scrollTop || elTop + elH > scrollTop + containerH) {
-        container.scrollTo({
-          top: elTop - containerH / 3,
-          behavior: 'smooth',
-        });
+        container.scrollTo({ top: elTop - containerH / 3, behavior: 'smooth' });
       }
     }
   }
 
   /* ══════════════════════════════════════════════
-     Export
+     Export logic
      ══════════════════════════════════════════════ */
 
-  function exportAs(format) {
-    if (!state.blocks.length) return;
+  async function exportAs(fileId, format) {
+    const fObj = state.files.find(f => f.id === fileId);
+    if (!fObj || !fObj.blocks.length) return;
 
-    let content = '';
-    let filename = '';
-    let mimeType = '';
+    const baseName = fObj.file.name.replace(/\.[^/.]+$/, "");
 
-    switch (format) {
-      case 'txt':
-        content = exportTXT();
-        filename = 'transcript.txt';
-        mimeType = 'text/plain;charset=utf-8';
-        break;
-      case 'srt':
-        content = exportSRT();
-        filename = 'transcript.srt';
-        mimeType = 'text/srt;charset=utf-8';
-        break;
-      default:
-        return;
+    if (format === 'txt') {
+      const content = fObj.blocks.map(b => `[${formatTimestamp(b.start)}] ${fObj.speakerNames[b.speaker]}:\n${b.text}\n`).join('\n');
+      downloadFile(content, `${baseName}.txt`, 'text/plain;charset=utf-8');
+      toast('Экспортировано в TXT', 'success');
+    } 
+    else if (format === 'srt') {
+      const content = fObj.blocks.map((b, i) => `${i + 1}\n${formatSrtTime(b.start)} --> ${formatSrtTime(b.end)}\n[${fObj.speakerNames[b.speaker]}] ${b.text}\n`).join('\n');
+      downloadFile(content, `${baseName}.srt`, 'text/srt;charset=utf-8');
+      toast('Экспортировано в SRT', 'success');
+    }
+    else if (format === 'docx') {
+      await exportWordDocx(fObj, baseName);
+    }
+  }
+
+  async function exportWordDocx(fObj, baseName) {
+    if (typeof docx === 'undefined') {
+      toast('Библиотека DOCX не загрузилась. Проверьте интернет.', 'error');
+      return;
     }
 
-    downloadFile(content, filename, mimeType);
-    toast(`Экспортировано в ${format.toUpperCase()}`, 'success');
-  }
+    toast('Генерация Word документа...', 'info');
 
-  function exportTXT() {
-    return state.blocks
-      .map((block) => {
-        const name = state.speakerNames[block.speaker] || block.speaker;
-        const time = formatTimestamp(block.start);
-        return `[${time}] ${name}:\n${block.text}\n`;
-      })
-      .join('\n');
-  }
+    const { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType } = docx;
 
-  function exportSRT() {
-    return state.blocks
-      .map((block, i) => {
-        const name = state.speakerNames[block.speaker] || block.speaker;
-        const startSrt = formatSrtTime(block.start);
-        const endSrt = formatSrtTime(block.end);
-        return `${i + 1}\n${startSrt} --> ${endSrt}\n[${name}] ${block.text}\n`;
-      })
-      .join('\n');
+    const docChildren = [
+      new Paragraph({
+        text: `Расшифровка: ${fObj.file.name}`,
+        heading: HeadingLevel.HEADING_1,
+        alignment: AlignmentType.CENTER,
+      }),
+      new Paragraph({ text: "" }), // spacer
+    ];
+
+    fObj.blocks.forEach(b => {
+      const name = fObj.speakerNames[b.speaker];
+      const time = formatTimestamp(b.start);
+      
+      docChildren.push(
+        new Paragraph({
+          children: [
+            new TextRun({ text: `[${time}] ${name}: `, bold: true, color: "444444" }),
+            new TextRun({ text: b.text })
+          ],
+          spacing: { after: 200 }
+        })
+      );
+    });
+
+    const doc = new Document({
+      sections: [{
+        properties: {},
+        children: docChildren,
+      }]
+    });
+
+    try {
+      const blob = await Packer.toBlob(doc);
+      saveAs(blob, `${baseName}.docx`);
+      toast('Экспортировано в Word', 'success');
+    } catch (e) {
+      console.error(e);
+      toast('Ошибка при генерации Word документа', 'error');
+    }
   }
 
   function downloadFile(content, filename, mime) {
     const blob = new Blob([content], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    saveAs(blob, filename); // Uses FileSaver.js included in head
   }
 
   /* ══════════════════════════════════════════════
@@ -510,9 +520,7 @@
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = Math.floor(seconds % 60);
-    if (h > 0) {
-      return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-    }
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
     return `${m}:${String(s).padStart(2, '0')}`;
   }
 
@@ -530,41 +538,18 @@
     return div.innerHTML;
   }
 
-  function resetState() {
-    state.currentFile = null;
-    state.blocks = [];
-    state.speakerNames = {};
-    dom.transcript.innerHTML = '';
-    dom.speakersList.innerHTML = '';
-    dom.fileInput.value = '';
-  }
-
-  /* ══════════════════════════════════════════════
-     Toast Notifications
-     ══════════════════════════════════════════════ */
-
   function toast(message, type = 'info') {
     const el = document.createElement('div');
     el.className = `toast ${type}`;
-
     const icons = { success: '✓', error: '✕', info: 'ℹ' };
     el.innerHTML = `<span>${icons[type] || 'ℹ'}</span> ${escapeHtml(message)}`;
-
     dom.toastContainer.appendChild(el);
-
-    // Trigger animation
     requestAnimationFrame(() => el.classList.add('visible'));
-
-    // Auto-dismiss
     setTimeout(() => {
       el.classList.remove('visible');
       setTimeout(() => el.remove(), 300);
     }, 4000);
   }
-
-  /* ══════════════════════════════════════════════
-     Boot
-     ══════════════════════════════════════════════ */
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);

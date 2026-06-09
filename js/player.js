@@ -1,18 +1,24 @@
 /**
  * Audio Player module — custom waveform player with transcript sync.
- * Uses the Web Audio API to decode audio and render a waveform on canvas.
+ * Designed to be instantiated multiple times per page.
  */
 
 class AudioPlayer {
-  constructor() {
-    this.audioEl = document.getElementById('audioPlayer');
-    this.canvas = document.getElementById('waveformCanvas');
-    this.ctx = this.canvas ? this.canvas.getContext('2d') : null;
-    this.progressEl = document.getElementById('waveformProgress');
-    this.cursorEl = document.getElementById('waveformCursor');
-    this.playBtn = document.getElementById('playBtn');
-    this.timeDisplay = document.getElementById('timeDisplay');
-    this.waveformContainer = document.getElementById('waveformContainer');
+  constructor(container) {
+    this.container = container;
+    
+    // Create DOM structure
+    this._renderHTML();
+    
+    // Bind elements
+    this.audioEl = this.container.querySelector('.audio-element');
+    this.canvas = this.container.querySelector('.waveform-canvas');
+    this.ctx = this.canvas.getContext('2d');
+    this.progressEl = this.container.querySelector('.waveform-progress');
+    this.cursorEl = this.container.querySelector('.waveform-cursor');
+    this.playBtn = this.container.querySelector('.btn-play');
+    this.timeDisplay = this.container.querySelector('.player-time');
+    this.waveformContainer = this.container.querySelector('.waveform-container');
 
     this.peaks = [];
     this.duration = 0;
@@ -23,22 +29,45 @@ class AudioPlayer {
     this._bindEvents();
   }
 
+  _renderHTML() {
+    this.container.innerHTML = `
+      <div class="player-controls-wrapper">
+          <div class="waveform-container">
+              <canvas class="waveform-canvas"></canvas>
+              <div class="waveform-progress"></div>
+              <div class="waveform-cursor"></div>
+          </div>
+
+          <div class="player-controls">
+              <button class="btn-play" title="Play / Pause">▶</button>
+              <div class="player-time">0:00 / 0:00</div>
+              
+              <div class="player-speed">
+                  <button class="speed-btn" data-speed="0.75">0.75x</button>
+                  <button class="speed-btn active" data-speed="1">1x</button>
+                  <button class="speed-btn" data-speed="1.25">1.25x</button>
+                  <button class="speed-btn" data-speed="1.5">1.5x</button>
+                  <button class="speed-btn" data-speed="2">2x</button>
+              </div>
+          </div>
+          
+          <audio class="audio-element hidden"></audio>
+      </div>
+    `;
+  }
+
   /* ── Public API ── */
 
   async loadFile(file) {
-    // Create object URL for the audio element
     const url = URL.createObjectURL(file);
     this.audioEl.src = url;
 
-    // Wait for metadata to load
     await new Promise((resolve) => {
       this.audioEl.addEventListener('loadedmetadata', resolve, { once: true });
     });
 
     this.duration = this.audioEl.duration;
     this._updateTime();
-
-    // Decode audio for waveform
     await this._renderWaveform(file);
   }
 
@@ -57,11 +86,8 @@ class AudioPlayer {
   }
 
   toggle() {
-    if (this.isPlaying) {
-      this.pause();
-    } else {
-      this.play();
-    }
+    if (this.isPlaying) this.pause();
+    else this.play();
   }
 
   seekTo(seconds) {
@@ -73,9 +99,8 @@ class AudioPlayer {
   setSpeed(speed) {
     this.currentSpeed = speed;
     this.audioEl.playbackRate = speed;
-
-    // Update speed buttons
-    document.querySelectorAll('.speed-btn').forEach((btn) => {
+    
+    this.container.querySelectorAll('.speed-btn').forEach((btn) => {
       btn.classList.toggle('active', parseFloat(btn.dataset.speed) === speed);
     });
   }
@@ -95,34 +120,25 @@ class AudioPlayer {
   /* ── Private ── */
 
   _bindEvents() {
-    if (this.playBtn) {
-      this.playBtn.addEventListener('click', () => this.toggle());
-    }
+    this.playBtn.addEventListener('click', () => this.toggle());
 
-    // Speed buttons
-    document.querySelectorAll('.speed-btn').forEach((btn) => {
+    this.container.querySelectorAll('.speed-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         this.setSpeed(parseFloat(btn.dataset.speed));
       });
     });
 
-    // Click on waveform to seek
-    if (this.waveformContainer) {
-      this.waveformContainer.addEventListener('click', (e) => {
-        const rect = this.waveformContainer.getBoundingClientRect();
-        const ratio = (e.clientX - rect.left) / rect.width;
-        this.seekTo(ratio * this.duration);
-      });
-    }
+    this.waveformContainer.addEventListener('click', (e) => {
+      const rect = this.waveformContainer.getBoundingClientRect();
+      const ratio = (e.clientX - rect.left) / rect.width;
+      this.seekTo(ratio * this.duration);
+    });
 
-    // Audio ended
-    if (this.audioEl) {
-      this.audioEl.addEventListener('ended', () => {
-        this.isPlaying = false;
-        this.playBtn.innerHTML = '▶';
-        this._stopAnimLoop();
-      });
-    }
+    this.audioEl.addEventListener('ended', () => {
+      this.isPlaying = false;
+      this.playBtn.innerHTML = '▶';
+      this._stopAnimLoop();
+    });
   }
 
   _startAnimLoop() {
@@ -149,12 +165,11 @@ class AudioPlayer {
   _updateProgress() {
     if (!this.duration) return;
     const pct = (this.audioEl.currentTime / this.duration) * 100;
-    if (this.progressEl) this.progressEl.style.width = pct + '%';
-    if (this.cursorEl) this.cursorEl.style.left = pct + '%';
+    this.progressEl.style.width = pct + '%';
+    this.cursorEl.style.left = pct + '%';
   }
 
   _updateTime() {
-    if (!this.timeDisplay) return;
     const cur = this._formatTime(this.audioEl.currentTime);
     const tot = this._formatTime(this.duration);
     this.timeDisplay.textContent = `${cur} / ${tot}`;
@@ -165,9 +180,7 @@ class AudioPlayer {
     const h = Math.floor(s / 3600);
     const m = Math.floor((s % 3600) / 60);
     const sec = Math.floor(s % 60);
-    if (h > 0) {
-      return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
-    }
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
     return `${m}:${String(sec).padStart(2, '0')}`;
   }
 
@@ -179,13 +192,10 @@ class AudioPlayer {
       const arrayBuf = await file.arrayBuffer();
       const audioBuf = await audioCtx.decodeAudioData(arrayBuf);
 
-      // Get channel data (mono mix)
       const raw = audioBuf.getChannelData(0);
-
-      // Compute the number of bars for the canvas width
       const dpr = window.devicePixelRatio || 1;
       const displayWidth = this.canvas.parentElement.clientWidth;
-      const displayHeight = this.canvas.parentElement.clientHeight;
+      const displayHeight = this.canvas.parentElement.clientHeight || 60; // default height
 
       this.canvas.width = displayWidth * dpr;
       this.canvas.height = displayHeight * dpr;
@@ -193,7 +203,7 @@ class AudioPlayer {
       this.canvas.style.height = displayHeight + 'px';
       this.ctx.scale(dpr, dpr);
 
-      const numBars = Math.floor(displayWidth / 3); // ~3px per bar
+      const numBars = Math.floor(displayWidth / 3);
       const samplesPerBar = Math.floor(raw.length / numBars);
       this.peaks = [];
 
@@ -206,7 +216,6 @@ class AudioPlayer {
         this.peaks.push(sum / samplesPerBar);
       }
 
-      // Normalize peaks
       const maxPeak = Math.max(...this.peaks, 0.01);
       this.peaks = this.peaks.map((p) => p / maxPeak);
 
@@ -232,7 +241,6 @@ class AudioPlayer {
       const x = i * step;
       const barH = Math.max(2, this.peaks[i] * maxBarH);
 
-      // Gradient color: idle bars
       const gradient = ctx.createLinearGradient(x, centerY - barH / 2, x, centerY + barH / 2);
       gradient.addColorStop(0, 'rgba(124, 92, 252, 0.6)');
       gradient.addColorStop(0.5, 'rgba(96, 165, 250, 0.4)');
@@ -246,5 +254,4 @@ class AudioPlayer {
   }
 }
 
-// Export to global scope
 window.AudioPlayer = AudioPlayer;
