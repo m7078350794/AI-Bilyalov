@@ -1,7 +1,6 @@
 /**
- * Main Application Logic — Расшифровщик
- * Handles file upload, API communication, transcript rendering,
- * speaker management, and export functionality.
+ * Main Application Logic - Расшифровщик
+ * Runs transcription locally in the browser with a Transformers.js worker.
  */
 
 (function () {
@@ -11,32 +10,24 @@
      Constants & State
      ══════════════════════════════════════════════ */
 
+  const TARGET_SAMPLE_RATE = 16000;
+  const WORKER_PATH = 'js/transcriber-worker.js';
+
   const SPEAKER_COLORS = [
     '#a78bfa', '#60a5fa', '#34d399', '#fbbf24', '#f87171',
     '#f472b6', '#22d3ee', '#a3e635', '#fb923c', '#c084fc',
   ];
 
   const state = {
-    // API keys & settings (loaded from localStorage)
-    openaiKey: '',
-    hfToken: '',
-    apiUrl: 'http://127.0.0.1:5000', // Default local backend
-
-    // Current file
     currentFile: null,
-
-    // Task
-    taskId: null,
-    pollInterval: null,
-
-    // Result
     blocks: [],           // [{speaker, text, start, end}]
-    speakerNames: {},     // SPEAKER_0 -> 'Иван'
+    speakerNames: {},     // SPEAKER_0 -> 'Спикер 1'
     hasDiarization: false,
     language: '',
-
-    // Audio player
     player: null,
+    worker: null,
+    workerJob: null,
+    currentProgress: 0,
   };
 
   /* ══════════════════════════════════════════════
@@ -44,7 +35,6 @@
      ══════════════════════════════════════════════ */
 
   const $ = (sel) => document.querySelector(sel);
-  const $$ = (sel) => document.querySelectorAll(sel);
 
   const dom = {
     // Views
@@ -66,15 +56,6 @@
     speakersList: $('#speakersList'),
     transcript: $('#transcript'),
 
-    // Settings
-    settingsBtn: $('#settingsBtn'),
-    settingsOverlay: $('#settingsOverlay'),
-    settingsForm: $('#settingsForm'),
-    cancelSettings: $('#cancelSettings'),
-    openaiInput: $('#openaiKeyInput'),
-    hfInput: $('#hfTokenInput'),
-    apiUrlInput: $('#apiUrlInput'),
-
     // Toast
     toastContainer: $('#toastContainer'),
   };
@@ -84,32 +65,11 @@
      ══════════════════════════════════════════════ */
 
   function init() {
-    loadSettings();
     bindEvents();
     showView('upload');
 
-    // Instantiate audio player
     state.player = new window.AudioPlayer();
     state.player.onTimeUpdate(onPlayerTimeUpdate);
-  }
-
-  function loadSettings() {
-    state.openaiKey = localStorage.getItem('rash_openai_key') || '';
-    state.hfToken = localStorage.getItem('rash_hf_token') || '';
-    state.apiUrl = localStorage.getItem('rash_api_url') || 'http://127.0.0.1:5000';
-  }
-
-  function saveSettings() {
-    state.openaiKey = dom.openaiInput.value.trim();
-    state.hfToken = dom.hfInput.value.trim();
-    // Ensure URL doesn't have trailing slash
-    let url = dom.apiUrlInput.value.trim();
-    if (url.endsWith('/')) url = url.slice(0, -1);
-    state.apiUrl = url || 'http://127.0.0.1:5000';
-
-    localStorage.setItem('rash_openai_key', state.openaiKey);
-    localStorage.setItem('rash_hf_token', state.hfToken);
-    localStorage.setItem('rash_api_url', state.apiUrl);
   }
 
   /* ══════════════════════════════════════════════
@@ -117,7 +77,7 @@
      ══════════════════════════════════════════════ */
 
   function bindEvents() {
-    // ── Drag & Drop ──
+    // Drag & drop
     dom.dropZone.addEventListener('click', () => dom.fileInput.click());
     dom.fileInput.addEventListener('change', (e) => {
       if (e.target.files.length) handleFile(e.target.files[0]);
@@ -140,20 +100,7 @@
       if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
     });
 
-    // ── Settings Modal ──
-    dom.settingsBtn.addEventListener('click', openSettings);
-    dom.cancelSettings.addEventListener('click', closeSettings);
-    dom.settingsOverlay.addEventListener('click', (e) => {
-      if (e.target === dom.settingsOverlay) closeSettings();
-    });
-    dom.settingsForm.addEventListener('submit', (e) => {
-      e.preventDefault();
-      saveSettings();
-      closeSettings();
-      toast('Настройки сохранены', 'success');
-    });
-
-    // ── New transcription button ──
+    // New transcription button
     document.addEventListener('click', (e) => {
       if (e.target.closest('#newTranscriptionBtn')) {
         resetState();
@@ -161,7 +108,7 @@
       }
     });
 
-    // ── Export buttons ──
+    // Export buttons
     document.addEventListener('click', (e) => {
       const btn = e.target.closest('.btn-export');
       if (btn) exportAs(btn.dataset.format);
@@ -169,140 +116,268 @@
   }
 
   /* ══════════════════════════════════════════════
-     Settings Modal
-     ══════════════════════════════════════════════ */
-
-  function openSettings() {
-    dom.openaiInput.value = state.openaiKey;
-    dom.hfInput.value = state.hfToken;
-    dom.apiUrlInput.value = state.apiUrl;
-    dom.settingsOverlay.classList.add('visible');
-  }
-
-  function closeSettings() {
-    dom.settingsOverlay.classList.remove('visible');
-  }
-
-  /* ══════════════════════════════════════════════
      File Handling
      ══════════════════════════════════════════════ */
 
   function handleFile(file) {
-    // Validate
-    if (!file.type.startsWith('audio/') && !file.name.match(/\.(mp3|wav|m4a|ogg|flac|aac|wma|webm|mp4)$/i)) {
-      toast('Пожалуйста, загрузите аудиофайл', 'error');
+    if (!isSupportedMedia(file)) {
+      toast('Пожалуйста, загрузите аудио или MP4-файл', 'error');
       return;
     }
 
-    if (!state.openaiKey) {
-      toast('Сначала укажите OpenAI API ключ в настройках', 'error');
-      openSettings();
+    if (state.workerJob) {
+      toast('Дождитесь завершения текущей расшифровки', 'info');
       return;
     }
 
+    resetState({ keepFileInput: true });
     state.currentFile = file;
-
-    // Load audio into player
-    state.player.loadFile(file);
-
-    // Start upload & transcription
     startTranscription(file);
   }
 
+  function isSupportedMedia(file) {
+    return (
+      file.type.startsWith('audio/') ||
+      file.type === 'video/mp4' ||
+      /\.(mp3|wav|m4a|ogg|flac|aac|wma|webm|mp4)$/i.test(file.name)
+    );
+  }
+
   /* ══════════════════════════════════════════════
-     Transcription Flow
+     Local Transcription Flow
      ══════════════════════════════════════════════ */
 
   async function startTranscription(file) {
     showView('processing');
     dom.processingFilename.textContent = file.name;
-    updateProgress(0, 'Загрузка файла...');
+    updateProgress(0.03, 'Готовлю аудио...');
 
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('openai_key', state.openaiKey);
-    formData.append('hf_token', state.hfToken);
-    formData.append('use_diarization', state.hfToken ? 'true' : 'false');
+    const playerLoadPromise = state.player.loadFile(file).catch((err) => {
+      console.warn('Could not load audio player:', err);
+    });
+
+    let softProgressTimer = null;
 
     try {
-      const res = await fetch(`${state.apiUrl}/api/transcribe`, {
-        method: 'POST',
-        body: formData,
-      });
+      updateProgress(0.08, 'Декодирую файл в браузере...');
+      const decoded = await decodeAudioFile(file);
 
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || 'Ошибка загрузки');
-      }
+      updateProgress(0.18, 'Загружаю локальную модель...');
+      softProgressTimer = startSoftProgress('Расшифровываю локально...');
 
-      const data = await res.json();
-      state.taskId = data.task_id;
+      const result = await transcribeLocally(decoded.samples);
 
-      // Start polling for status
-      startPolling();
-    } catch (err) {
-      toast(err.message, 'error');
-      showView('upload');
-    }
-  }
+      stopSoftProgress(softProgressTimer);
+      updateProgress(0.96, 'Собираю результат...');
 
-  function startPolling() {
-    state.pollInterval = setInterval(async () => {
-      try {
-        const res = await fetch(`${state.apiUrl}/api/status/${state.taskId}`);
-        const data = await res.json();
+      await playerLoadPromise;
+      applyResult(normalizeTranscription(result, decoded.duration));
 
-        updateProgress(data.progress, data.message);
-
-        if (data.status === 'completed') {
-          stopPolling();
-          await loadResult();
-        } else if (data.status === 'error') {
-          stopPolling();
-          toast(data.error || 'Произошла ошибка', 'error');
-          showView('upload');
-        }
-      } catch (err) {
-        stopPolling();
-        toast('Потеряна связь с сервером', 'error');
-        showView('upload');
-      }
-    }, 1000);
-  }
-
-  function stopPolling() {
-    if (state.pollInterval) {
-      clearInterval(state.pollInterval);
-      state.pollInterval = null;
-    }
-  }
-
-  async function loadResult() {
-    try {
-      const res = await fetch(`${state.apiUrl}/api/result/${state.taskId}`);
-      const data = await res.json();
-
-      state.blocks = data.blocks || [];
-      state.hasDiarization = data.has_diarization;
-      state.language = data.language;
-
-      // Initialize speaker names
-      const speakers = new Set(state.blocks.map((b) => b.speaker));
-      state.speakerNames = {};
-      speakers.forEach((s) => {
-        const idx = parseInt(s.replace('SPEAKER_', ''), 10);
-        state.speakerNames[s] = `Спикер ${idx + 1}`;
-      });
-
+      updateProgress(1, 'Готово!');
       showView('results');
       renderSpeakers();
       renderTranscript();
 
       toast('Транскрипция готова!', 'success');
     } catch (err) {
-      toast('Ошибка загрузки результата', 'error');
+      stopSoftProgress(softProgressTimer);
+      toast(err.message || 'Не удалось расшифровать файл', 'error');
       showView('upload');
     }
+  }
+
+  async function decodeAudioFile(file) {
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      const mono = mixToMono(audioBuffer);
+      const samples = resampleAudio(mono, audioBuffer.sampleRate, TARGET_SAMPLE_RATE);
+
+      return {
+        samples,
+        duration: audioBuffer.duration,
+      };
+    } finally {
+      if (typeof audioContext.close === 'function') {
+        audioContext.close();
+      }
+    }
+  }
+
+  function mixToMono(audioBuffer) {
+    const { numberOfChannels, length } = audioBuffer;
+
+    if (numberOfChannels === 1) {
+      return new Float32Array(audioBuffer.getChannelData(0));
+    }
+
+    const mixed = new Float32Array(length);
+    for (let channel = 0; channel < numberOfChannels; channel++) {
+      const data = audioBuffer.getChannelData(channel);
+      for (let i = 0; i < length; i++) {
+        mixed[i] += data[i] / numberOfChannels;
+      }
+    }
+
+    return mixed;
+  }
+
+  function resampleAudio(input, sourceRate, targetRate) {
+    if (sourceRate === targetRate) {
+      return input;
+    }
+
+    const ratio = sourceRate / targetRate;
+    const outputLength = Math.max(1, Math.round(input.length / ratio));
+    const output = new Float32Array(outputLength);
+
+    for (let i = 0; i < outputLength; i++) {
+      const sourceIndex = i * ratio;
+      const before = Math.floor(sourceIndex);
+      const after = Math.min(before + 1, input.length - 1);
+      const weight = sourceIndex - before;
+      output[i] = input[before] * (1 - weight) + input[after] * weight;
+    }
+
+    return output;
+  }
+
+  function transcribeLocally(samples) {
+    return new Promise((resolve, reject) => {
+      if (state.workerJob) {
+        reject(new Error('Другая расшифровка уже выполняется'));
+        return;
+      }
+
+      const worker = getTranscriberWorker();
+      state.workerJob = { resolve, reject };
+      worker.postMessage({ type: 'transcribe', audio: samples.buffer }, [samples.buffer]);
+    });
+  }
+
+  function getTranscriberWorker() {
+    if (state.worker) {
+      return state.worker;
+    }
+
+    state.worker = new Worker(WORKER_PATH, { type: 'module' });
+    state.worker.addEventListener('message', handleWorkerMessage);
+    state.worker.addEventListener('error', handleWorkerError);
+
+    return state.worker;
+  }
+
+  function handleWorkerMessage(event) {
+    const message = event.data || {};
+
+    if (message.type === 'download') {
+      const downloadProgress = clamp(message.progress || 0, 0, 1);
+      updateProgress(0.18 + downloadProgress * 0.34, message.message);
+      return;
+    }
+
+    if (message.type === 'status') {
+      updateProgress(message.progress ?? state.currentProgress, message.message);
+      return;
+    }
+
+    if (message.type === 'ready') {
+      updateProgress(0.56, message.message || 'Модель готова...');
+      return;
+    }
+
+    if (message.type === 'running') {
+      updateProgress(0.62, message.message || 'Расшифровываю локально...');
+      return;
+    }
+
+    if (message.type === 'complete') {
+      const job = state.workerJob;
+      state.workerJob = null;
+      if (job) job.resolve(message.result);
+      return;
+    }
+
+    if (message.type === 'error') {
+      const job = state.workerJob;
+      state.workerJob = null;
+      if (job) job.reject(new Error(message.error || 'Ошибка локальной модели'));
+    }
+  }
+
+  function handleWorkerError(error) {
+    const job = state.workerJob;
+    state.workerJob = null;
+
+    if (job) {
+      job.reject(new Error(error.message || 'Worker локальной модели не запустился'));
+    }
+
+    if (state.worker) {
+      state.worker.terminate();
+      state.worker = null;
+    }
+  }
+
+  function normalizeTranscription(result, duration) {
+    const rawChunks = Array.isArray(result?.chunks) ? result.chunks : [];
+    const blocks = [];
+    let lastEnd = 0;
+
+    rawChunks.forEach((chunk) => {
+      const text = (chunk.text || '').trim();
+      if (!text) return;
+
+      const [rawStart, rawEnd] = Array.isArray(chunk.timestamp) ? chunk.timestamp : [];
+      let start = Number(rawStart);
+      let end = Number(rawEnd);
+
+      if (!Number.isFinite(start) || start < 0) start = lastEnd;
+      if (!Number.isFinite(end) || end <= start) end = Math.min(duration || start + 2, start + 2);
+
+      blocks.push({
+        speaker: 'SPEAKER_0',
+        text,
+        start,
+        end,
+      });
+
+      lastEnd = end;
+    });
+
+    if (!blocks.length && result?.text?.trim()) {
+      blocks.push({
+        speaker: 'SPEAKER_0',
+        text: result.text.trim(),
+        start: 0,
+        end: duration || 0,
+      });
+    }
+
+    return {
+      blocks,
+      has_diarization: false,
+      language: result?.language || 'auto',
+    };
+  }
+
+  function applyResult(data) {
+    state.blocks = data.blocks || [];
+    state.hasDiarization = Boolean(data.has_diarization);
+    state.language = data.language || '';
+
+    if (!state.blocks.length) {
+      throw new Error('Модель не нашла речи в этом файле');
+    }
+
+    const speakers = new Set(state.blocks.map((b) => b.speaker));
+    state.speakerNames = {};
+    speakers.forEach((speakerId) => {
+      const idx = parseInt(speakerId.replace('SPEAKER_', ''), 10);
+      state.speakerNames[speakerId] = `Спикер ${idx + 1}`;
+    });
   }
 
   /* ══════════════════════════════════════════════
@@ -310,10 +385,30 @@
      ══════════════════════════════════════════════ */
 
   function updateProgress(progress, message) {
-    const pct = Math.round(progress * 100);
+    const value = clamp(Number(progress), 0, 1);
+    const pct = Math.round(value * 100);
+
+    state.currentProgress = value;
     dom.progressFill.style.width = pct + '%';
     dom.progressPct.textContent = pct + '%';
-    dom.progressMsg.textContent = message || '';
+
+    if (message) {
+      dom.progressMsg.textContent = message;
+    }
+  }
+
+  function startSoftProgress(message) {
+    return window.setInterval(() => {
+      if (state.currentProgress >= 0.9) return;
+      const next = state.currentProgress + Math.max(0.002, (0.9 - state.currentProgress) * 0.025);
+      updateProgress(Math.min(next, 0.9), message);
+    }, 1200);
+  }
+
+  function stopSoftProgress(timer) {
+    if (timer) {
+      window.clearInterval(timer);
+    }
   }
 
   /* ══════════════════════════════════════════════
@@ -338,9 +433,8 @@
     if (!state.hasDiarization) {
       container.innerHTML = `
         <div class="diarization-note">
-          ⚠️ Автоматическое определение спикеров недоступно.
-          Для включения диаризации укажите HuggingFace токен в настройках
-          и установите pyannote.audio.
+          Бесплатный локальный режим: разделение по спикерам отключено.
+          Можно переименовать общий поток речи вручную.
         </div>
       `;
     }
@@ -378,7 +472,6 @@
     if (!newName) return;
     state.speakerNames[speakerId] = newName;
 
-    // Update all speaker labels in the transcript
     document.querySelectorAll(`.block-speaker-name[data-speaker="${speakerId}"]`).forEach((el) => {
       el.textContent = newName;
     });
@@ -416,7 +509,6 @@
         <div class="block-text">${escapeHtml(block.text)}</div>
       `;
 
-      // Click timestamp to seek
       el.querySelector('.block-timestamp').addEventListener('click', () => {
         state.player.seekTo(block.start);
         state.player.play();
@@ -443,7 +535,6 @@
       if (isActive) activeEl = el;
     });
 
-    // Auto-scroll to active block
     if (activeEl) {
       const container = dom.transcript;
       const elTop = activeEl.offsetTop - container.offsetTop;
@@ -528,7 +619,7 @@
      ══════════════════════════════════════════════ */
 
   function formatTimestamp(seconds) {
-    if (!seconds || isNaN(seconds)) return '0:00';
+    if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = Math.floor(seconds % 60);
@@ -539,10 +630,11 @@
   }
 
   function formatSrtTime(seconds) {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = Math.floor(seconds % 60);
-    const ms = Math.round((seconds % 1) * 1000);
+    const value = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+    const h = Math.floor(value / 3600);
+    const m = Math.floor((value % 3600) / 60);
+    const s = Math.floor(value % 60);
+    const ms = Math.round((value % 1) * 1000);
     return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
   }
 
@@ -552,16 +644,28 @@
     return div.innerHTML;
   }
 
-  function resetState() {
-    stopPolling();
+  function clamp(value, min, max) {
+    if (!Number.isFinite(value)) return min;
+    return Math.min(max, Math.max(min, value));
+  }
+
+  function resetState(options = {}) {
+    if (state.player?.pause) {
+      state.player.pause();
+    }
+
     state.currentFile = null;
-    state.taskId = null;
     state.blocks = [];
     state.speakerNames = {};
     state.hasDiarization = false;
+    state.language = '';
+    state.currentProgress = 0;
     dom.transcript.innerHTML = '';
     dom.speakersList.innerHTML = '';
-    dom.fileInput.value = '';
+
+    if (!options.keepFileInput) {
+      dom.fileInput.value = '';
+    }
   }
 
   /* ══════════════════════════════════════════════
@@ -577,10 +681,8 @@
 
     dom.toastContainer.appendChild(el);
 
-    // Trigger animation
     requestAnimationFrame(() => el.classList.add('visible'));
 
-    // Auto-dismiss
     setTimeout(() => {
       el.classList.remove('visible');
       setTimeout(() => el.remove(), 300);
