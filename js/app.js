@@ -1,6 +1,7 @@
 /**
- * Main Application Logic - Расшифровщик
- * Runs transcription locally in the browser with a Transformers.js worker.
+ * Main Application Logic — Расшифровщик (Serverless via AssemblyAI)
+ * Handles file upload, direct API communication, transcript rendering,
+ * speaker management, and export functionality without a backend.
  */
 
 (function () {
@@ -10,24 +11,32 @@
      Constants & State
      ══════════════════════════════════════════════ */
 
-  const TARGET_SAMPLE_RATE = 16000;
-  const WORKER_PATH = 'js/transcriber-worker.js';
-
   const SPEAKER_COLORS = [
     '#a78bfa', '#60a5fa', '#34d399', '#fbbf24', '#f87171',
     '#f472b6', '#22d3ee', '#a3e635', '#fb923c', '#c084fc',
   ];
 
+  const ASSEMBLY_API_BASE = 'https://api.assemblyai.com/v2';
+
   const state = {
+    // API key (loaded from localStorage)
+    assemblyKey: '',
+
+    // Current file
     currentFile: null,
+
+    // Task
+    taskId: null,
+    pollInterval: null,
+
+    // Result
     blocks: [],           // [{speaker, text, start, end}]
     speakerNames: {},     // SPEAKER_0 -> 'Спикер 1'
-    hasDiarization: false,
+    hasDiarization: true, // AssemblyAI always does diarization if requested
     language: '',
+
+    // Audio player
     player: null,
-    worker: null,
-    workerJob: null,
-    currentProgress: 0,
   };
 
   /* ══════════════════════════════════════════════
@@ -35,6 +44,7 @@
      ══════════════════════════════════════════════ */
 
   const $ = (sel) => document.querySelector(sel);
+  const $$ = (sel) => document.querySelectorAll(sel);
 
   const dom = {
     // Views
@@ -56,6 +66,13 @@
     speakersList: $('#speakersList'),
     transcript: $('#transcript'),
 
+    // Settings
+    settingsBtn: $('#settingsBtn'),
+    settingsOverlay: $('#settingsOverlay'),
+    settingsForm: $('#settingsForm'),
+    cancelSettings: $('#cancelSettings'),
+    assemblyKeyInput: $('#assemblyKeyInput'),
+
     // Toast
     toastContainer: $('#toastContainer'),
   };
@@ -65,11 +82,22 @@
      ══════════════════════════════════════════════ */
 
   function init() {
+    loadSettings();
     bindEvents();
     showView('upload');
 
+    // Instantiate audio player
     state.player = new window.AudioPlayer();
     state.player.onTimeUpdate(onPlayerTimeUpdate);
+  }
+
+  function loadSettings() {
+    state.assemblyKey = localStorage.getItem('rash_assembly_key') || '';
+  }
+
+  function saveSettings() {
+    state.assemblyKey = dom.assemblyKeyInput.value.trim();
+    localStorage.setItem('rash_assembly_key', state.assemblyKey);
   }
 
   /* ══════════════════════════════════════════════
@@ -77,7 +105,7 @@
      ══════════════════════════════════════════════ */
 
   function bindEvents() {
-    // Drag & drop
+    // ── Drag & Drop ──
     dom.dropZone.addEventListener('click', () => dom.fileInput.click());
     dom.fileInput.addEventListener('change', (e) => {
       if (e.target.files.length) handleFile(e.target.files[0]);
@@ -100,7 +128,20 @@
       if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
     });
 
-    // New transcription button
+    // ── Settings Modal ──
+    dom.settingsBtn.addEventListener('click', openSettings);
+    dom.cancelSettings.addEventListener('click', closeSettings);
+    dom.settingsOverlay.addEventListener('click', (e) => {
+      if (e.target === dom.settingsOverlay) closeSettings();
+    });
+    dom.settingsForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      saveSettings();
+      closeSettings();
+      toast('Настройки сохранены', 'success');
+    });
+
+    // ── New transcription button ──
     document.addEventListener('click', (e) => {
       if (e.target.closest('#newTranscriptionBtn')) {
         resetState();
@@ -108,7 +149,7 @@
       }
     });
 
-    // Export buttons
+    // ── Export buttons ──
     document.addEventListener('click', (e) => {
       const btn = e.target.closest('.btn-export');
       if (btn) exportAs(btn.dataset.format);
@@ -116,268 +157,178 @@
   }
 
   /* ══════════════════════════════════════════════
+     Settings Modal
+     ══════════════════════════════════════════════ */
+
+  function openSettings() {
+    dom.assemblyKeyInput.value = state.assemblyKey;
+    dom.settingsOverlay.classList.add('visible');
+  }
+
+  function closeSettings() {
+    dom.settingsOverlay.classList.remove('visible');
+  }
+
+  /* ══════════════════════════════════════════════
      File Handling
      ══════════════════════════════════════════════ */
 
   function handleFile(file) {
-    if (!isSupportedMedia(file)) {
-      toast('Пожалуйста, загрузите аудио или MP4-файл', 'error');
+    // Validate
+    if (!file.type.startsWith('audio/') && !file.name.match(/\.(mp3|wav|m4a|ogg|flac|aac|wma|webm|mp4)$/i)) {
+      toast('Пожалуйста, загрузите аудиофайл', 'error');
       return;
     }
 
-    if (state.workerJob) {
-      toast('Дождитесь завершения текущей расшифровки', 'info');
+    if (!state.assemblyKey) {
+      toast('Сначала укажите AssemblyAI API ключ в настройках', 'error');
+      openSettings();
       return;
     }
 
-    resetState({ keepFileInput: true });
     state.currentFile = file;
+
+    // Load audio into player
+    state.player.loadFile(file);
+
+    // Start upload & transcription
     startTranscription(file);
   }
 
-  function isSupportedMedia(file) {
-    return (
-      file.type.startsWith('audio/') ||
-      file.type === 'video/mp4' ||
-      /\.(mp3|wav|m4a|ogg|flac|aac|wma|webm|mp4)$/i.test(file.name)
-    );
-  }
-
   /* ══════════════════════════════════════════════
-     Local Transcription Flow
+     Transcription Flow (AssemblyAI Direct Integration)
      ══════════════════════════════════════════════ */
 
   async function startTranscription(file) {
     showView('processing');
     dom.processingFilename.textContent = file.name;
-    updateProgress(0.03, 'Готовлю аудио...');
-
-    const playerLoadPromise = state.player.loadFile(file).catch((err) => {
-      console.warn('Could not load audio player:', err);
-    });
-
-    let softProgressTimer = null;
+    updateProgress(0.1, 'Загрузка файла на сервер (1/3)...');
 
     try {
-      updateProgress(0.08, 'Декодирую файл в браузере...');
-      const decoded = await decodeAudioFile(file);
+      // Step 1: Upload the file to AssemblyAI
+      const uploadRes = await fetch(`${ASSEMBLY_API_BASE}/upload`, {
+        method: 'POST',
+        headers: {
+          'Authorization': state.assemblyKey,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: file,
+      });
 
-      updateProgress(0.18, 'Загружаю локальную модель...');
-      softProgressTimer = startSoftProgress('Расшифровываю локально...');
+      if (!uploadRes.ok) {
+        throw new Error('Ошибка загрузки файла. Проверьте API ключ.');
+      }
+      
+      const uploadData = await uploadRes.json();
+      const audioUrl = uploadData.upload_url;
 
-      const result = await transcribeLocally(decoded.samples);
+      // Step 2: Submit the transcription job
+      updateProgress(0.3, 'Запуск распознавания и разделения голосов (2/3)...');
+      
+      const transcriptRes = await fetch(`${ASSEMBLY_API_BASE}/transcript`, {
+        method: 'POST',
+        headers: {
+          'Authorization': state.assemblyKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          audio_url: audioUrl,
+          speaker_labels: true, // Enable diarization!
+          language_detection: true, // Auto-detect language
+        }),
+      });
 
-      stopSoftProgress(softProgressTimer);
-      updateProgress(0.96, 'Собираю результат...');
+      if (!transcriptRes.ok) {
+        throw new Error('Ошибка запуска транскрипции');
+      }
 
-      await playerLoadPromise;
-      applyResult(normalizeTranscription(result, decoded.duration));
+      const transcriptData = await transcriptRes.json();
+      state.taskId = transcriptData.id;
 
-      updateProgress(1, 'Готово!');
-      showView('results');
-      renderSpeakers();
-      renderTranscript();
+      // Step 3: Poll for completion
+      startPolling();
 
-      toast('Транскрипция готова!', 'success');
     } catch (err) {
-      stopSoftProgress(softProgressTimer);
-      toast(err.message || 'Не удалось расшифровать файл', 'error');
+      toast(err.message, 'error');
       showView('upload');
     }
   }
 
-  async function decodeAudioFile(file) {
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  function startPolling() {
+    // Prevent multiple pollers
+    if (state.pollInterval) clearInterval(state.pollInterval);
 
-    try {
-      const arrayBuffer = await file.arrayBuffer();
-      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-      const mono = mixToMono(audioBuffer);
-      const samples = resampleAudio(mono, audioBuffer.sampleRate, TARGET_SAMPLE_RATE);
+    state.pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`${ASSEMBLY_API_BASE}/transcript/${state.taskId}`, {
+          headers: { 'Authorization': state.assemblyKey },
+        });
+        const data = await res.json();
 
-      return {
-        samples,
-        duration: audioBuffer.duration,
-      };
-    } finally {
-      if (typeof audioContext.close === 'function') {
-        audioContext.close();
+        if (data.status === 'processing') {
+          // AssemblyAI doesn't provide precise percentage, we fake a slow progress
+          const currPct = parseInt(dom.progressPct.textContent) / 100;
+          const nextPct = Math.min(currPct + 0.05, 0.90);
+          updateProgress(nextPct, 'Идет анализ и диаризация... (это займет время)');
+        } 
+        else if (data.status === 'completed') {
+          stopPolling();
+          processResult(data);
+        } 
+        else if (data.status === 'error') {
+          stopPolling();
+          toast(data.error || 'Произошла ошибка при расшифровке', 'error');
+          showView('upload');
+        }
+      } catch (err) {
+        console.error('Polling error:', err);
       }
+    }, 3000); // Poll every 3 seconds
+  }
+
+  function stopPolling() {
+    if (state.pollInterval) {
+      clearInterval(state.pollInterval);
+      state.pollInterval = null;
     }
   }
 
-  function mixToMono(audioBuffer) {
-    const { numberOfChannels, length } = audioBuffer;
-
-    if (numberOfChannels === 1) {
-      return new Float32Array(audioBuffer.getChannelData(0));
-    }
-
-    const mixed = new Float32Array(length);
-    for (let channel = 0; channel < numberOfChannels; channel++) {
-      const data = audioBuffer.getChannelData(channel);
-      for (let i = 0; i < length; i++) {
-        mixed[i] += data[i] / numberOfChannels;
-      }
-    }
-
-    return mixed;
-  }
-
-  function resampleAudio(input, sourceRate, targetRate) {
-    if (sourceRate === targetRate) {
-      return input;
-    }
-
-    const ratio = sourceRate / targetRate;
-    const outputLength = Math.max(1, Math.round(input.length / ratio));
-    const output = new Float32Array(outputLength);
-
-    for (let i = 0; i < outputLength; i++) {
-      const sourceIndex = i * ratio;
-      const before = Math.floor(sourceIndex);
-      const after = Math.min(before + 1, input.length - 1);
-      const weight = sourceIndex - before;
-      output[i] = input[before] * (1 - weight) + input[after] * weight;
-    }
-
-    return output;
-  }
-
-  function transcribeLocally(samples) {
-    return new Promise((resolve, reject) => {
-      if (state.workerJob) {
-        reject(new Error('Другая расшифровка уже выполняется'));
-        return;
-      }
-
-      const worker = getTranscriberWorker();
-      state.workerJob = { resolve, reject };
-      worker.postMessage({ type: 'transcribe', audio: samples.buffer }, [samples.buffer]);
-    });
-  }
-
-  function getTranscriberWorker() {
-    if (state.worker) {
-      return state.worker;
-    }
-
-    state.worker = new Worker(WORKER_PATH, { type: 'module' });
-    state.worker.addEventListener('message', handleWorkerMessage);
-    state.worker.addEventListener('error', handleWorkerError);
-
-    return state.worker;
-  }
-
-  function handleWorkerMessage(event) {
-    const message = event.data || {};
-
-    if (message.type === 'download') {
-      const downloadProgress = clamp(message.progress || 0, 0, 1);
-      updateProgress(0.18 + downloadProgress * 0.34, message.message);
-      return;
-    }
-
-    if (message.type === 'status') {
-      updateProgress(message.progress ?? state.currentProgress, message.message);
-      return;
-    }
-
-    if (message.type === 'ready') {
-      updateProgress(0.56, message.message || 'Модель готова...');
-      return;
-    }
-
-    if (message.type === 'running') {
-      updateProgress(0.62, message.message || 'Расшифровываю локально...');
-      return;
-    }
-
-    if (message.type === 'complete') {
-      const job = state.workerJob;
-      state.workerJob = null;
-      if (job) job.resolve(message.result);
-      return;
-    }
-
-    if (message.type === 'error') {
-      const job = state.workerJob;
-      state.workerJob = null;
-      if (job) job.reject(new Error(message.error || 'Ошибка локальной модели'));
-    }
-  }
-
-  function handleWorkerError(error) {
-    const job = state.workerJob;
-    state.workerJob = null;
-
-    if (job) {
-      job.reject(new Error(error.message || 'Worker локальной модели не запустился'));
-    }
-
-    if (state.worker) {
-      state.worker.terminate();
-      state.worker = null;
-    }
-  }
-
-  function normalizeTranscription(result, duration) {
-    const rawChunks = Array.isArray(result?.chunks) ? result.chunks : [];
-    const blocks = [];
-    let lastEnd = 0;
-
-    rawChunks.forEach((chunk) => {
-      const text = (chunk.text || '').trim();
-      if (!text) return;
-
-      const [rawStart, rawEnd] = Array.isArray(chunk.timestamp) ? chunk.timestamp : [];
-      let start = Number(rawStart);
-      let end = Number(rawEnd);
-
-      if (!Number.isFinite(start) || start < 0) start = lastEnd;
-      if (!Number.isFinite(end) || end <= start) end = Math.min(duration || start + 2, start + 2);
-
-      blocks.push({
-        speaker: 'SPEAKER_0',
-        text,
-        start,
-        end,
-      });
-
-      lastEnd = end;
-    });
-
-    if (!blocks.length && result?.text?.trim()) {
-      blocks.push({
-        speaker: 'SPEAKER_0',
-        text: result.text.trim(),
+  function processResult(data) {
+    updateProgress(1.0, 'Готово!');
+    state.language = data.language_code;
+    
+    // Map AssemblyAI utterances to our blocks format
+    if (data.utterances && data.utterances.length > 0) {
+      state.blocks = data.utterances.map((u) => ({
+        speaker: `SPEAKER_${u.speaker}`, // They return 'A', 'B', 'C', we convert for consistency or just use raw
+        text: u.text,
+        start: u.start / 1000, // Convert ms to seconds
+        end: u.end / 1000,
+      }));
+    } else {
+      // Fallback if no utterances (e.g., only 1 speaker or diarization failed)
+      state.blocks = [{
+        speaker: 'SPEAKER_A',
+        text: data.text,
         start: 0,
-        end: duration || 0,
-      });
+        end: state.player.getDuration() || 0,
+      }];
     }
 
-    return {
-      blocks,
-      has_diarization: false,
-      language: result?.language || 'auto',
-    };
-  }
-
-  function applyResult(data) {
-    state.blocks = data.blocks || [];
-    state.hasDiarization = Boolean(data.has_diarization);
-    state.language = data.language || '';
-
-    if (!state.blocks.length) {
-      throw new Error('Модель не нашла речи в этом файле');
-    }
-
+    // Initialize speaker names
     const speakers = new Set(state.blocks.map((b) => b.speaker));
     state.speakerNames = {};
-    speakers.forEach((speakerId) => {
-      const idx = parseInt(speakerId.replace('SPEAKER_', ''), 10);
-      state.speakerNames[speakerId] = `Спикер ${idx + 1}`;
+    
+    let index = 1;
+    speakers.forEach((s) => {
+      state.speakerNames[s] = `Спикер ${index++}`;
     });
+
+    showView('results');
+    renderSpeakers();
+    renderTranscript();
+
+    toast('Транскрипция успешно завершена!', 'success');
   }
 
   /* ══════════════════════════════════════════════
@@ -385,30 +336,10 @@
      ══════════════════════════════════════════════ */
 
   function updateProgress(progress, message) {
-    const value = clamp(Number(progress), 0, 1);
-    const pct = Math.round(value * 100);
-
-    state.currentProgress = value;
+    const pct = Math.round(progress * 100);
     dom.progressFill.style.width = pct + '%';
     dom.progressPct.textContent = pct + '%';
-
-    if (message) {
-      dom.progressMsg.textContent = message;
-    }
-  }
-
-  function startSoftProgress(message) {
-    return window.setInterval(() => {
-      if (state.currentProgress >= 0.9) return;
-      const next = state.currentProgress + Math.max(0.002, (0.9 - state.currentProgress) * 0.025);
-      updateProgress(Math.min(next, 0.9), message);
-    }, 1200);
-  }
-
-  function stopSoftProgress(timer) {
-    if (timer) {
-      window.clearInterval(timer);
-    }
+    dom.progressMsg.textContent = message || '';
   }
 
   /* ══════════════════════════════════════════════
@@ -430,18 +361,8 @@
     const container = dom.speakersList;
     container.innerHTML = '';
 
-    if (!state.hasDiarization) {
-      container.innerHTML = `
-        <div class="diarization-note">
-          Бесплатный локальный режим: разделение по спикерам отключено.
-          Можно переименовать общий поток речи вручную.
-        </div>
-      `;
-    }
-
-    speakers.forEach((speakerId) => {
-      const idx = parseInt(speakerId.replace('SPEAKER_', ''), 10);
-      const color = SPEAKER_COLORS[idx % SPEAKER_COLORS.length];
+    speakers.forEach((speakerId, i) => {
+      const color = SPEAKER_COLORS[i % SPEAKER_COLORS.length];
       const count = state.blocks.filter((b) => b.speaker === speakerId).length;
 
       const item = document.createElement('div');
@@ -472,6 +393,7 @@
     if (!newName) return;
     state.speakerNames[speakerId] = newName;
 
+    // Update all speaker labels in the transcript
     document.querySelectorAll(`.block-speaker-name[data-speaker="${speakerId}"]`).forEach((el) => {
       el.textContent = newName;
     });
@@ -485,9 +407,12 @@
     const container = dom.transcript;
     container.innerHTML = '';
 
+    // Get ordered keys to assign colors consistently
+    const speakerKeys = Object.keys(state.speakerNames);
+
     state.blocks.forEach((block, i) => {
-      const idx = parseInt(block.speaker.replace('SPEAKER_', ''), 10);
-      const color = SPEAKER_COLORS[idx % SPEAKER_COLORS.length];
+      const colorIndex = speakerKeys.indexOf(block.speaker);
+      const color = SPEAKER_COLORS[colorIndex % SPEAKER_COLORS.length];
       const name = state.speakerNames[block.speaker] || block.speaker;
 
       const el = document.createElement('div');
@@ -509,6 +434,7 @@
         <div class="block-text">${escapeHtml(block.text)}</div>
       `;
 
+      // Click timestamp to seek
       el.querySelector('.block-timestamp').addEventListener('click', () => {
         state.player.seekTo(block.start);
         state.player.play();
@@ -535,6 +461,7 @@
       if (isActive) activeEl = el;
     });
 
+    // Auto-scroll to active block
     if (activeEl) {
       const container = dom.transcript;
       const elTop = activeEl.offsetTop - container.offsetTop;
@@ -619,7 +546,7 @@
      ══════════════════════════════════════════════ */
 
   function formatTimestamp(seconds) {
-    if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
+    if (!seconds || isNaN(seconds)) return '0:00';
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = Math.floor(seconds % 60);
@@ -630,11 +557,10 @@
   }
 
   function formatSrtTime(seconds) {
-    const value = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
-    const h = Math.floor(value / 3600);
-    const m = Math.floor((value % 3600) / 60);
-    const s = Math.floor(value % 60);
-    const ms = Math.round((value % 1) * 1000);
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    const ms = Math.round((seconds % 1) * 1000);
     return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
   }
 
@@ -644,28 +570,15 @@
     return div.innerHTML;
   }
 
-  function clamp(value, min, max) {
-    if (!Number.isFinite(value)) return min;
-    return Math.min(max, Math.max(min, value));
-  }
-
-  function resetState(options = {}) {
-    if (state.player?.pause) {
-      state.player.pause();
-    }
-
+  function resetState() {
+    stopPolling();
     state.currentFile = null;
+    state.taskId = null;
     state.blocks = [];
     state.speakerNames = {};
-    state.hasDiarization = false;
-    state.language = '';
-    state.currentProgress = 0;
     dom.transcript.innerHTML = '';
     dom.speakersList.innerHTML = '';
-
-    if (!options.keepFileInput) {
-      dom.fileInput.value = '';
-    }
+    dom.fileInput.value = '';
   }
 
   /* ══════════════════════════════════════════════
@@ -681,8 +594,10 @@
 
     dom.toastContainer.appendChild(el);
 
+    // Trigger animation
     requestAnimationFrame(() => el.classList.add('visible'));
 
+    // Auto-dismiss
     setTimeout(() => {
       el.classList.remove('visible');
       setTimeout(() => el.remove(), 300);

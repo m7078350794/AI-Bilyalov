@@ -159,23 +159,11 @@
                 Настройки API
             </h2>
             
-            <form id="settingsForm">
+            <form id="settingsForm" class="settings-form">
                 <div class="form-group">
-                    <label for="openaiKeyInput">OpenAI или Groq API Key (обязательно)</label>
-                    <input type="password" id="openaiKeyInput" placeholder="sk-... или gsk_..." required>
-                    <div class="hint">Используется для распознавания речи. Вставьте ключ от OpenAI (платный, Whisper API) или <a href="https://console.groq.com/keys" target="_blank">ключ от Groq</a> (бесплатный, работает в 10 раз быстрее!). Бэкенд сам определит нужный сервис.</div>
-                </div>
-
-                <div class="form-group">
-                    <label for="hfTokenInput">HuggingFace Token (опционально)</label>
-                    <input type="password" id="hfTokenInput" placeholder="hf_...">
-                    <div class="hint">Необходим для разделения по голосам (диаризации). <a href="https://huggingface.co/settings/tokens" target="_blank">Получить токен</a> и <a href="https://huggingface.co/pyannote/speaker-diarization-3.1" target="_blank">принять условия</a>.</div>
-                </div>
-
-                <div class="form-group">
-                    <label for="apiUrlInput">URL Бэкенд-сервера</label>
-                    <input type="url" id="apiUrlInput" placeholder="http://127.0.0.1:5000">
-                    <div class="hint">Если бэкенд размещен на другом сервере, укажите его адрес здесь. Для локального запуска оставьте по умолчанию.</div>
+                    <label for="assemblyKeyInput">AssemblyAI API Key (обязательно)</label>
+                    <input type="password" id="assemblyKeyInput" placeholder="Ваш ключ..." required>
+                    <div class="hint">Необходим для распознавания речи и разделения по голосам. <a href="https://www.assemblyai.com/dashboard/login" target="_blank">Получить ключ бесплатно</a>. Бэкенд-сервер больше не требуется, все запросы идут напрямую!</div>
                 </div>
 
                 <div class="modal-actions">
