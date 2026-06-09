@@ -192,42 +192,64 @@
      Transcription Flow (Deepgram Direct Integration)
      ══════════════════════════════════════════════ */
 
-  async function startTranscription(file) {
+  function startTranscription(file) {
     showView('processing');
     dom.processingFilename.textContent = file.name;
-    updateProgress(0.2, 'Отправка аудио в Deepgram...');
+    updateProgress(0, 'Подготовка...');
 
-    try {
-      // Create a simulated progress for the synchronous fetch request
-      let simProgress = 0.2;
-      const interval = setInterval(() => {
-        simProgress = Math.min(simProgress + 0.05, 0.95);
-        updateProgress(simProgress, 'Анализ аудио и разделение по спикерам... (Deepgram работает быстро!)');
-      }, 1000);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', DEEPGRAM_API_BASE, true);
+    xhr.setRequestHeader('Authorization', `Token ${state.deepgramKey}`);
+    xhr.setRequestHeader('Content-Type', file.type || 'audio/mpeg');
 
-      const response = await fetch(DEEPGRAM_API_BASE, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Token ${state.deepgramKey}`,
-          'Content-Type': file.type || 'audio/mpeg'
-        },
-        body: file,
-      });
-
-      clearInterval(interval);
-
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Ошибка API (${response.status}): ${errText}`);
+    // Реальный прогресс загрузки файла
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const percent = e.loaded / e.total;
+        // Загрузка занимает первые 80% визуального прогресс-бара
+        updateProgress(percent * 0.8, `Загрузка файла: ${Math.round(percent * 100)}%...`);
       }
+    };
 
-      const data = await response.json();
-      processResult(data);
+    let fakeProgressInterval;
 
-    } catch (err) {
-      toast(err.message, 'error');
+    // Когда файл полностью загрузился на сервера Deepgram
+    xhr.upload.onload = () => {
+      updateProgress(0.85, 'Аудио загружено. Deepgram анализирует голоса...');
+      let simProgress = 0.85;
+      // Запускаем медленный прогресс-бар для ожидания ответа
+      fakeProgressInterval = setInterval(() => {
+        simProgress = Math.min(simProgress + 0.01, 0.99);
+        updateProgress(simProgress, 'Расшифровка и диаризация... (пожалуйста, подождите)');
+      }, 1500);
+    };
+
+    // Обработка успешного/неуспешного ответа
+    xhr.onload = () => {
+      clearInterval(fakeProgressInterval);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          processResult(data);
+        } catch (e) {
+          toast('Ошибка обработки данных от сервера', 'error');
+          showView('upload');
+        }
+      } else {
+        toast(`Ошибка API (${xhr.status}): ${xhr.responseText}`, 'error');
+        showView('upload');
+      }
+    };
+
+    // Сетевая ошибка (например, отвалился интернет)
+    xhr.onerror = () => {
+      clearInterval(fakeProgressInterval);
+      toast('Сетевая ошибка при обращении к API. Проверьте интернет.', 'error');
       showView('upload');
-    }
+    };
+
+    // Отправляем файл как бинарные данные
+    xhr.send(file);
   }
 
   function processResult(data) {
